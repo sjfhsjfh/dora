@@ -15,6 +15,7 @@ mod start;
 mod stop;
 mod up;
 
+use enum_dispatch::enum_dispatch;
 pub use run::run_func;
 
 use build::Build;
@@ -30,12 +31,13 @@ use logs::LogsArgs;
 use new::NewArgs;
 use run::Run;
 use runtime::Runtime;
-use self_::SelfSubCommand;
+use self_::Self_;
 use start::Start;
 use stop::Stop;
 use up::Up;
 
 /// dora-rs cli client
+#[enum_dispatch(Executable)]
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
     Check(Check),
@@ -61,10 +63,7 @@ pub enum Command {
     Coordinator(Coordinator),
     Inspect(Inspect),
 
-    Self_ {
-        #[clap(subcommand)]
-        command: SelfSubCommand,
-    },
+    Self_(Self_),
 }
 
 fn default_tracing() -> eyre::Result<()> {
@@ -80,29 +79,7 @@ fn default_tracing() -> eyre::Result<()> {
     Ok(())
 }
 
+#[enum_dispatch]
 pub trait Executable {
     fn execute(self) -> eyre::Result<()>;
-}
-
-impl Executable for Command {
-    fn execute(self) -> eyre::Result<()> {
-        match self {
-            Command::Check(args) => args.execute(),
-            Command::Coordinator(args) => args.execute(),
-            Command::Graph(args) => args.execute(),
-            Command::Build(args) => args.execute(),
-            Command::New(args) => args.execute(),
-            Command::Run(args) => args.execute(),
-            Command::Up(args) => args.execute(),
-            Command::Destroy(args) => args.execute(),
-            Command::Start(args) => args.execute(),
-            Command::Stop(args) => args.execute(),
-            Command::List(args) => args.execute(),
-            Command::Logs(args) => args.execute(),
-            Command::Daemon(args) => args.execute(),
-            Command::Self_ { command } => command.execute(),
-            Command::Runtime(args) => args.execute(),
-            Command::Inspect(args) => args.execute(),
-        }
-    }
 }
