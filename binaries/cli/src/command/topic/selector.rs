@@ -14,6 +14,7 @@ use dora_message::{
     id::{DataId, NodeId},
 };
 use eyre::{Context, ContextCompat, bail};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 #[derive(Debug, clap::Args)]
@@ -107,7 +108,11 @@ impl TopicSelector {
                     data_id: output.clone(),
                 })
             }));
-            return Ok(TopicSubscriptionContext::new(dataflow_id, data, zenoh_session));
+            return Ok(TopicSubscriptionContext::new(
+                dataflow_id,
+                data,
+                zenoh_session,
+            ));
         }
 
         for s in &self.data {
@@ -145,7 +150,11 @@ impl TopicSelector {
             }
         }
 
-        Ok(TopicSubscriptionContext::new(dataflow_id, data, zenoh_session))
+        Ok(TopicSubscriptionContext::new(
+            dataflow_id,
+            data,
+            zenoh_session,
+        ))
     }
 }
 
@@ -180,5 +189,25 @@ impl TopicSubscriptionContext {
             topics: topics.into_iter().collect(),
             zenoh_session,
         }
+    }
+
+    /// Spawn one async task per topic, applying the given async handler, and
+    /// return the `JoinSet` managing those tasks. The caller is responsible for
+    /// driving the `JoinSet` to completion or cancellation.
+    pub fn spawn_for_each_topic<F, Fut>(&self, f: F) -> JoinSet<eyre::Result<()>>
+    where
+        F: FnMut(zenoh::Session, DataflowId, TopicIdentifier) -> Fut + Send + Clone + 'static,
+        Fut: std::future::Future<Output = eyre::Result<()>> + Send + 'static,
+    {
+        let mut join_set = JoinSet::new();
+        for topic in &self.topics {
+            let session = self.zenoh_session.clone();
+            let dataflow_id = self.dataflow_id;
+            let topic = topic.clone();
+            let mut f_closure = f.clone();
+            let fut = f_closure(session, dataflow_id, topic);
+            join_set.spawn(fut);
+        }
+        join_set
     }
 }

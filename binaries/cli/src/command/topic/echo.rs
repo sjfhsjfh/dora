@@ -11,12 +11,12 @@ use dora_message::{
     metadata::{ArrowTypeInfo, BufferOffset, Parameter},
 };
 use eyre::{Context, eyre};
-use tokio::{runtime::Builder, task::JoinSet};
+use tokio::runtime::Builder;
 use uuid::Uuid;
 
 use crate::{
     command::{
-        Executable, default_tracing,
+        Executable,
         topic::selector::{TopicIdentifier, TopicSelector},
     },
     common::CoordinatorOptions,
@@ -62,8 +62,6 @@ pub struct Echo {
 
 impl Executable for Echo {
     fn execute(self) -> eyre::Result<()> {
-        default_tracing()?;
-
         inspect(self.coordinator, self.selector, self.format)
     }
 }
@@ -87,16 +85,12 @@ fn inspect(
             .resolve(session.as_mut(), zenoh_session)
             .context("failed to resolve topics")?;
 
-        let mut join_set = JoinSet::new();
-        for TopicIdentifier { node_id, data_id } in ctx.topics {
-            join_set.spawn(log_to_terminal(
-                ctx.zenoh_session.clone(),
-                ctx.dataflow_id,
-                node_id,
-                data_id,
-                format,
-            ));
-        }
+        let mut join_set = ctx.spawn_for_each_topic(
+            move |z_session, dataflow_id, TopicIdentifier { node_id, data_id }| async move {
+                log_to_terminal(z_session, dataflow_id, node_id, data_id, format).await
+            },
+        );
+
         while let Some(res) = join_set.join_next().await {
             match res {
                 Ok(Ok(())) => {}

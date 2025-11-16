@@ -6,7 +6,7 @@ use itertools::Itertools;
 use ratatui::{DefaultTerminal, prelude::*, widgets::*};
 use std::{
     borrow::Cow,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     iter,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -74,12 +74,7 @@ impl Executable for Hz {
                 .selector
                 .resolve(session.as_mut(), zenoh_session)
                 .context("failed to resolve topics")?;
-            run_hz(
-                terminal,
-                self.window,
-                ctx,
-            )
-            .await
+            run_hz(terminal, self.window, ctx).await
         })
         .inspect(|_| {
             ratatui::restore();
@@ -172,22 +167,34 @@ async fn run_hz(
     window: usize,
     ctx: TopicSubscriptionContext,
 ) -> eyre::Result<()> {
-    // Add a synthetic aggregate entry ("<ALL>") that merges all outputs
-    let mut topics_with_all = Vec::with_capacity(ctx.topics.len() + 1);
-    topics_with_all.push(TopicIdentifier {
+    // Build per-topic stats map and a separate aggregate (ALL) entry.
+    let mut stats_map: BTreeMap<TopicIdentifier, Arc<HzStats>> = BTreeMap::new();
+    for topic in &ctx.topics {
+        stats_map.insert(topic.clone(), Arc::new(HzStats::new(window)));
+    }
+    let all_key = TopicIdentifier {
         node_id: "<ALL>".to_string().into(),
         data_id: "*".to_string().into(),
-    });
-    topics_with_all.extend(ctx.topics.into_iter());
+    };
+    let all_stats = Arc::new(HzStats::new(window));
+    stats_map.insert(all_key.clone(), all_stats.clone());
 
-    let stats = topics_with_all
+    // Ordered view for UI (ALL first, then others)
+    let mut ordered_keys: Vec<TopicIdentifier> = stats_map.keys().cloned().collect();
+    ordered_keys.sort();
+    if let Some(pos) = ordered_keys.iter().position(|k| k == &all_key) {
+        ordered_keys.remove(pos);
+    }
+    ordered_keys.insert(0, all_key.clone());
+
+    let stats: Vec<(&TopicIdentifier, Arc<HzStats>)> = ordered_keys
         .iter()
-        .map(|topic| (topic, Arc::new(HzStats::new(window))))
-        .collect::<Vec<_>>();
+        .map(|k| (k, stats_map.get(k).unwrap().clone()))
+        .collect();
 
     let mut selected: usize = 0;
     // Ssub-window for instantaneous rate (Hz)
-    let sub_window = Duration::from_millis(1000);
+    let sub_window = Duration::from_millis(200);
     // Keep a flowing sparkline per topic for recent rates
     let mut rate_series: Vec<VecDeque<u64>> = vec![VecDeque::with_capacity(240); stats.len()];
     // Start time to decide whether full window elapsed
@@ -204,38 +211,29 @@ async fn run_hz(
         )
     })?;
 
-    let zenoh_session = ctx.zenoh_session;
-
-    // Spawn subscribers for each output with shutdown signal
+    // Spawn subscribers for each output with shutdown signal (excluding ALL)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut tasks = Vec::new();
-    // Spawn subscribers for each output
-    // Aggregator is at index 0
-    let all_stats = stats[0].1.clone();
-    for (i, (topic, hz_stats)) in stats.iter().enumerate() {
-        if i == 0 {
-            continue;
-        }
-        let zenoh_session = zenoh_session.clone();
-        let topic = (*topic).clone();
-        let hz_stats = hz_stats.clone();
-        let all_stats_cloned = all_stats.clone();
-        let shutdown_rx = shutdown_rx.clone();
-        tasks.push(tokio::spawn(async move {
-            if let Err(e) = subscribe_output(
+    // for topic_id in &ctx.topics {
+    let mut data_join = ctx.spawn_for_each_topic(move |zenoh_session, dataflow_id, topic_id| {
+        let per_topic = stats_map
+            .get(&topic_id)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(HzStats::new(window)));
+        let all_stats = all_stats.clone();
+        let rx = shutdown_rx.clone();
+        let topic = topic_id.clone();
+        async move {
+            subscribe_output(
                 zenoh_session,
-                ctx.dataflow_id,
+                dataflow_id,
                 &topic,
-                hz_stats,
-                Some(all_stats_cloned),
-                shutdown_rx,
+                per_topic,
+                Some(all_stats),
+                rx,
             )
             .await
-            {
-                eprintln!("Error subscribing to {topic}: {e}");
-            }
-        }));
-    }
+        }
+    });
 
     loop {
         // Update per-topic instantaneous rate and append to series
@@ -301,10 +299,18 @@ async fn run_hz(
         }
     }
 
-    // Signal shutdown to subscribers and await their completion
+    // Signal shutdown to subscribers
     let _ = shutdown_tx.send(true);
-    for task in tasks {
-        let _ = task.await;
+    while let Some(res) = data_join.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("Error while inspecting output: {e}");
+            }
+            Err(e) => {
+                eprintln!("Join error: {e}");
+            }
+        }
     }
 
     Ok(())
@@ -411,16 +417,21 @@ fn ui(
     // Reserve space for a one-line footer with shortcut hints.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([Constraint::Min(15), Constraint::Length(1)])
         .split(f.area());
 
-    f.render_widget(table, chunks[0]);
+    let table_and_chart = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[0]);
+
+    f.render_widget(table, table_and_chart[0]);
 
     // Charts area split horizontally
     let chart_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+        .split(table_and_chart[1]);
 
     // Draw charts for the selected topic if available
     if let Some((name, selected_stats)) = stats.get(selected) {
@@ -537,5 +548,5 @@ fn ui(
     let footer = Paragraph::new("Up/Down: Select  |  Exit: q / Ctrl-C / Esc")
         .style(Style::default().fg(Color::Yellow))
         .alignment(Alignment::Center);
-    f.render_widget(footer, chunks[2]);
+    f.render_widget(footer, chunks[1]);
 }
