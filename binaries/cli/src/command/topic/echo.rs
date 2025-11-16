@@ -74,8 +74,6 @@ fn inspect(
     format: OutputFormat,
 ) -> eyre::Result<()> {
     let mut session = coordinator.connect()?;
-    let (dataflow_id, topics) = selector.resolve(session.as_mut())?;
-
     let rt = Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -85,11 +83,15 @@ fn inspect(
             .await
             .context("failed to open zenoh session")?;
 
+        let ctx = selector
+            .resolve(session.as_mut(), zenoh_session)
+            .context("failed to resolve topics")?;
+
         let mut join_set = JoinSet::new();
-        for TopicIdentifier { node_id, data_id } in topics {
+        for TopicIdentifier { node_id, data_id } in ctx.topics {
             join_set.spawn(log_to_terminal(
-                zenoh_session.clone(),
-                dataflow_id,
+                ctx.zenoh_session.clone(),
+                ctx.dataflow_id,
                 node_id,
                 data_id,
                 format,

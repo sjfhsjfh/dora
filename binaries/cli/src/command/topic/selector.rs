@@ -26,11 +26,13 @@ pub struct DataflowSelector {
 impl DataflowSelector {
     pub fn resolve(
         &self,
-        session: &mut TcpRequestReplyConnection,
+        coordinator_session: &mut TcpRequestReplyConnection,
     ) -> eyre::Result<(Uuid, Descriptor)> {
-        let dataflow_id =
-            resolve_dataflow_identifier_interactive(&mut *session, self.dataflow.as_deref())?;
-        let reply_raw = session
+        let dataflow_id = resolve_dataflow_identifier_interactive(
+            &mut *coordinator_session,
+            self.dataflow.as_deref(),
+        )?;
+        let reply_raw = coordinator_session
             .request(
                 &serde_json::to_vec(&ControlRequest::Info {
                     dataflow_uuid: dataflow_id,
@@ -52,7 +54,9 @@ impl DataflowSelector {
 pub struct TopicSelector {
     #[clap(flatten)]
     pub dataflow: DataflowSelector,
-    /// Data to inspect, e.g. `node_id/output_id`
+    /// Data to inspect, e.g. `node_id/output_id`.
+    ///
+    /// When left empty, all outputs of the selected dataflow are used.
     #[clap(value_name = "DATA")]
     pub data: Vec<String>,
 }
@@ -72,9 +76,10 @@ impl fmt::Display for TopicIdentifier {
 impl TopicSelector {
     pub fn resolve(
         &self,
-        session: &mut TcpRequestReplyConnection,
-    ) -> eyre::Result<(DataflowId, BTreeSet<TopicIdentifier>)> {
-        let (dataflow_id, dataflow_descriptor) = self.dataflow.resolve(session)?;
+        coordinator_session: &mut TcpRequestReplyConnection,
+        zenoh_session: zenoh::Session,
+    ) -> eyre::Result<TopicSubscriptionContext> {
+        let (dataflow_id, dataflow_descriptor) = self.dataflow.resolve(coordinator_session)?;
         if !dataflow_descriptor.debug.publish_all_messages_to_zenoh {
             bail!(
                 "Dataflow `{dataflow_id}` does not have `publish_all_messages_to_zenoh` enabled. You should enable it in order to inspect data.\n\
@@ -102,7 +107,7 @@ impl TopicSelector {
                     data_id: output.clone(),
                 })
             }));
-            return Ok((dataflow_id, data));
+            return Ok(TopicSubscriptionContext::new(dataflow_id, data, zenoh_session));
         }
 
         for s in &self.data {
@@ -140,6 +145,40 @@ impl TopicSelector {
             }
         }
 
-        Ok((dataflow_id, data))
+        Ok(TopicSubscriptionContext::new(dataflow_id, data, zenoh_session))
+    }
+}
+
+/// Convenience context for subscribing to one or more outputs of a dataflow
+/// over zenoh.
+///
+/// This groups the resolved `dataflow_id`, a set of `TopicIdentifier`s, and a
+/// zenoh `Session` so that higher-level commands (e.g. `echo`, `hz`) can share
+/// subscription logic without reimplementing dataflow resolution and session
+/// setup.
+#[derive(Clone)]
+pub struct TopicSubscriptionContext {
+    pub dataflow_id: DataflowId,
+    pub topics: Vec<TopicIdentifier>,
+    pub zenoh_session: zenoh::Session,
+}
+
+impl TopicSubscriptionContext {
+    /// Construct a subscription context from the most primitive pieces: a
+    /// resolved dataflow id, a list of topics, and an open zenoh session.
+    ///
+    /// Higher-level helpers (such as `TopicSelector::resolve`) can keep their
+    /// own "smart" behaviour (e.g. expanding empty selections to all
+    /// outputs) and then adapt their results into this context. This struct
+    /// itself does not apply any additional selection logic.
+    pub fn new<I>(dataflow_id: DataflowId, topics: I, zenoh_session: zenoh::Session) -> Self
+    where
+        I: IntoIterator<Item = TopicIdentifier>,
+    {
+        Self {
+            dataflow_id,
+            topics: topics.into_iter().collect(),
+            zenoh_session,
+        }
     }
 }

@@ -6,21 +6,16 @@ use itertools::Itertools;
 use ratatui::{DefaultTerminal, prelude::*, widgets::*};
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, VecDeque},
+    collections::VecDeque,
     iter,
-    net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::{
-    command::{
-        Executable,
-        topic::selector::{TopicIdentifier, TopicSelector},
-    },
-    common::CoordinatorOptions,
-};
+use crate::command::topic::selector::{TopicIdentifier, TopicSelector, TopicSubscriptionContext};
+use crate::{command::Executable, common::CoordinatorOptions};
 
 /// Measure topic publish intervals.
 ///
@@ -65,21 +60,24 @@ pub struct Hz {
 
 impl Executable for Hz {
     fn execute(self) -> eyre::Result<()> {
-        let mut session = self.coordinator.connect()?;
-        let (dataflow_id, topics) = self.selector.resolve(session.as_mut())?;
-
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .context("tokio runtime failed")?;
         let terminal = ratatui::init();
         rt.block_on(async move {
+            let mut session = self.coordinator.connect()?;
+            let zenoh_session = open_zenoh_session(Some(self.coordinator.coordinator_addr))
+                .await
+                .context("failed to open zenoh session")?;
+            let ctx = self
+                .selector
+                .resolve(session.as_mut(), zenoh_session)
+                .context("failed to resolve topics")?;
             run_hz(
                 terminal,
                 self.window,
-                dataflow_id,
-                topics,
-                self.coordinator.coordinator_addr,
+                ctx,
             )
             .await
         })
@@ -172,17 +170,15 @@ struct Stats {
 async fn run_hz(
     mut terminal: DefaultTerminal,
     window: usize,
-    dataflow_id: Uuid,
-    outputs: BTreeSet<TopicIdentifier>,
-    coordinator_addr: IpAddr,
+    ctx: TopicSubscriptionContext,
 ) -> eyre::Result<()> {
     // Add a synthetic aggregate entry ("<ALL>") that merges all outputs
-    let mut topics_with_all = Vec::with_capacity(outputs.len() + 1);
+    let mut topics_with_all = Vec::with_capacity(ctx.topics.len() + 1);
     topics_with_all.push(TopicIdentifier {
         node_id: "<ALL>".to_string().into(),
         data_id: "*".to_string().into(),
     });
-    topics_with_all.extend(outputs.into_iter());
+    topics_with_all.extend(ctx.topics.into_iter());
 
     let stats = topics_with_all
         .iter()
@@ -208,10 +204,11 @@ async fn run_hz(
         )
     })?;
 
-    let zenoh_session = open_zenoh_session(Some(coordinator_addr))
-        .await
-        .context("failed to open zenoh session")?;
+    let zenoh_session = ctx.zenoh_session;
 
+    // Spawn subscribers for each output with shutdown signal
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut tasks = Vec::new();
     // Spawn subscribers for each output
     // Aggregator is at index 0
     let all_stats = stats[0].1.clone();
@@ -223,19 +220,21 @@ async fn run_hz(
         let topic = (*topic).clone();
         let hz_stats = hz_stats.clone();
         let all_stats_cloned = all_stats.clone();
-        tokio::spawn(async move {
+        let shutdown_rx = shutdown_rx.clone();
+        tasks.push(tokio::spawn(async move {
             if let Err(e) = subscribe_output(
                 zenoh_session,
-                dataflow_id,
+                ctx.dataflow_id,
                 &topic,
                 hz_stats,
                 Some(all_stats_cloned),
+                shutdown_rx,
             )
             .await
             {
                 eprintln!("Error subscribing to {topic}: {e}");
             }
-        });
+        }));
     }
 
     loop {
@@ -302,6 +301,12 @@ async fn run_hz(
         }
     }
 
+    // Signal shutdown to subscribers and await their completion
+    let _ = shutdown_tx.send(true);
+    for task in tasks {
+        let _ = task.await;
+    }
+
     Ok(())
 }
 
@@ -311,6 +316,7 @@ async fn subscribe_output(
     topic: &TopicIdentifier,
     hz_stats: Arc<HzStats>,
     aggregate: Option<Arc<HzStats>>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> eyre::Result<()> {
     let subscribe_topic = zenoh_output_publish_topic(dataflow_id, &topic.node_id, &topic.data_id);
     let subscriber = zenoh_session
@@ -319,23 +325,22 @@ async fn subscribe_output(
         .map_err(|e| eyre!(e))
         .wrap_err_with(|| format!("failed to subscribe to {topic}"))?;
 
-    while let Ok(sample) = subscriber.recv_async().await {
-        let event = match Timestamped::deserialize_inter_daemon_event(&sample.payload().to_bytes())
-        {
-            Ok(event) => event,
-            Err(_) => continue,
-        };
-
-        match event.inner {
-            InterDaemonEvent::Output { .. } => {
-                let now = Instant::now();
-                hz_stats.record(now);
-                if let Some(all) = &aggregate {
-                    all.record(now);
+    loop {
+        tokio::select! {
+            res = subscriber.recv_async() => {
+                let sample = match res { Ok(s) => s, Err(_) => break };
+                let event = match Timestamped::deserialize_inter_daemon_event(&sample.payload().to_bytes()) { Ok(e) => e, Err(_) => continue };
+                match event.inner {
+                    InterDaemonEvent::Output { .. } => {
+                        let now = Instant::now();
+                        hz_stats.record(now);
+                        if let Some(all) = &aggregate { all.record(now); }
+                    }
+                    InterDaemonEvent::OutputClosed { .. } => { break; }
                 }
             }
-            InterDaemonEvent::OutputClosed { .. } => {
-                break;
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
             }
         }
     }
@@ -351,16 +356,6 @@ fn ui(
     start: Instant,
     window_dur: Duration,
 ) {
-    // Layout: table | charts | footer
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(55),
-            Constraint::Percentage(44),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
-
     // Table header: interval stats in ms + derived avg Hz
     let header = Row::new([
         "Output", "Avg (ms)", "Avg (Hz)", "Min (ms)", "Max (ms)", "Std (ms)",
