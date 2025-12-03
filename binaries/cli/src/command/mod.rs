@@ -8,6 +8,7 @@ mod graph;
 mod list;
 mod logs;
 mod new;
+mod node;
 mod run;
 mod runtime;
 mod self_;
@@ -30,6 +31,7 @@ use graph::Graph;
 use list::ListArgs;
 use logs::LogsArgs;
 use new::NewArgs;
+use node::Node;
 use run::Run;
 use runtime::Runtime;
 use self_::SelfSubCommand;
@@ -63,6 +65,8 @@ pub enum Command {
     Daemon(Daemon),
     Runtime(Runtime),
     Coordinator(Coordinator),
+    #[clap(subcommand)]
+    Node(Node),
     #[clap(subcommand)]
     Topic(Topic),
 
@@ -108,6 +112,7 @@ impl Executable for Command {
             Command::Daemon(args) => args.execute(),
             Command::Self_ { command } => command.execute(),
             Command::Runtime(args) => args.execute(),
+            Command::Node(args) => args.execute(),
             Command::Topic(args) => args.execute(),
             Command::Completion(args) => args.execute(),
         }

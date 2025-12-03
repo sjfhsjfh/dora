@@ -6,7 +6,7 @@ use crate::command::{
 mod echo;
 mod hz;
 mod list;
-mod selector;
+pub mod selector;
 
 /// Manage and inspect dataflow topics.
 #[derive(Debug, clap::Subcommand)]
