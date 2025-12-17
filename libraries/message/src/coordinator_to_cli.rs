@@ -46,6 +46,13 @@ pub enum ControlRequestReply {
         default_daemon: Option<IpAddr>,
         cli: Option<IpAddr>,
     },
+    NodeSystemInfo {
+        node: String,
+        /// In cores%
+        cpu: f32,
+        /// Bytes
+        memory: u64,
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]

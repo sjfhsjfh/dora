@@ -773,6 +773,17 @@ async fn start_inner(
                                 },
                             ));
                         }
+                        ControlRequest::SystemInfo { node } => {
+                            let mut cpu = 0.0;
+                            let mut memory = 0u64;
+                            // TODO: real data
+                            let reply = Ok(ControlRequestReply::NodeSystemInfo {
+                                node: node.clone(),
+                                cpu,
+                                memory,
+                            });
+                            let _ = reply_sender.send(reply);
+                        }
                     }
                 }
                 ControlEvent::Error(err) => tracing::error!("{err:?}"),
